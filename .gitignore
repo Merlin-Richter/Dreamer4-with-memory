@@ -1,0 +1,13 @@
+.venv/
+data/
+checkpoints/
+runs/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+build/
+dist/
+logs/
+slurm-*.out
+
