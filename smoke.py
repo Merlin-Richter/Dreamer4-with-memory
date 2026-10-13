@@ -3,9 +3,29 @@ import torch
 
 from models.tokenizer import AutoEncoder, AutoEncoderConfig
 from models.dynamics_model import DynamicsModel, DynamicsModelConfig
+from training.train_tokenizer import normalize_loss
+
+
+def check_loss_normalization():
+    # Positive rescaling of a loss must not change its normalized gradient.
+    # An attached denominator would instead cancel the gradient entirely.
+    for scale in (0.001, 1., 1000.):
+        x = torch.tensor([2., 3.], requires_grad=True)
+        loss = 0.8 * normalize_loss(x[0].square()) + 0.2 * normalize_loss(scale * x[1].square())
+        loss.backward()
+        torch.testing.assert_close(x.grad, torch.tensor([0.8, 0.4 / 3]))
+    # The epsilon floor keeps exact and near-zero losses/gradients finite.
+    for value in (0., 1e-12):
+        loss = torch.tensor(value, requires_grad=True)
+        normalized = normalize_loss(loss)
+        normalized.backward()
+        torch.testing.assert_close(normalized, torch.tensor(value / 1e-8))
+        torch.testing.assert_close(loss.grad, torch.tensor(1e8))
+    print('Passed: detached loss normalization, scale-invariant gradients, and zero-loss handling.')
 
 
 def main():
+    check_loss_normalization()
     torch.manual_seed(0)
     torch.set_num_threads(1)
     shared = dict(

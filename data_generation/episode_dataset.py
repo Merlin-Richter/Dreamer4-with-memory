@@ -85,10 +85,27 @@ class RandomClipBatches(Sampler):
 
 
 if __name__ == "__main__":
+    import argparse
     import matplotlib.pyplot as plt
-    dataset = EpisodeClips("data/cards.h5", 32, 'train')
-    print((len(dataset), dataset.starts_per_episode))
+
+
+    parser = argparse.ArgumentParser(description="Inspect a dataset")
+    parser.add_argument("dataset-path", help="dataset file to inspect")
+    parser.add_argument("--clip-size", help="clip size the dataset loader should serve", default=32)
+
+    args = parser.parse_args()
+
+    dataset = EpisodeClips(args.dataset_path, 32, 'train')
+
+    print()
+    print(f"Dataset shape (each clip contains {args.clip_size} time steps; different starts are overlapping):")
+    print("clips shape: (" + str(len(dataset)) + " episodes, " + str(dataset.starts_per_episode) + " starts per episode, 2(frames / actions) )")
+
     frames, actions = dataset[0, 0]
+
+    print()
+    print(f"frames shape of clip [0, 0]: " + str(frames.shape))
+    print(f"actions shape of clip [0, 0]: " + str(actions.shape))
 
     for x in range(32):
         plt.imshow(frames[x])

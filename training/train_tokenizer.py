@@ -1,9 +1,15 @@
-"""Train an RGB tokenizer from saved episode clips: MSE + 0.1 worst-patch MSE, FP32.
+"""Train an RGB tokenizer with separately normalized MSE, worst-patch MSE and LPIPS.
+
+Objective: norm(MSE) + 0.1 norm(worst-patch MSE) + lpips_weight norm(LPIPS),
+where norm(L) = L / max(stop_gradient(abs(L)), 1e-8). FP32 throughout.
 
 Example: python -m training.train_tokenizer --data data/cards.h5 --output runs/tokenizer_cards
 Batches always contain batch_size * context_size frames. Temporal attention is
 optional (off by default); masking and dropout are off. No environment imports.
 Resume with --resume; --steps is the total desired optimizer update count.
+Logged losses are raw, before normalization. --lpips-weight 0 disables LPIPS.
+LPIPS uses frozen VGG weights;
+the first run downloads them to TORCH_HOME (PyTorch's default cache if unset).
 """
 import argparse
 from dataclasses import asdict
@@ -26,18 +32,30 @@ def tensor(frames, device, temporal_attention):
     return frames
 
 
-def reconstruction_loss(prediction, target, patch_size):
-    """Add the worst non-overlapping patch error per frame, without object labels."""
+def normalize_loss(loss):
+    """Normalize a batch-mean scalar; only the numerator receives gradients."""
+    return loss / loss.detach().abs().clamp_min(1e-8)
+
+
+def reconstruction_losses(prediction, target, patch_size):
+    """Return raw MSE and mean worst-patch MSE per frame, without object labels."""
     error = (prediction - target).square()
     h, w, channels = error.shape[-3:]
     patches = error.reshape(-1, h // patch_size, patch_size, w // patch_size, patch_size, channels)
     patch_mse = patches.mean(dim=(2, 4, 5))
     mse = error.mean()
-    return mse + 0.1 * patch_mse.flatten(1).max(dim=1).values.mean(), mse
+    return mse, patch_mse.flatten(1).max(dim=1).values.mean()
+
+
+def perceptual_loss(metric, prediction, target):
+    """Evaluate LPIPS per frame: (B,T,H,W,3) [0,1] -> (B*T,3,H,W)."""
+    prediction = prediction.flatten(0, 1).permute(0, 3, 1, 2)
+    target = target.flatten(0, 1).permute(0, 3, 1, 2)
+    return metric(prediction, target, normalize=True).mean()
 
 
 def main():
-    """Load clips, train, and record the training objective and training/validation MSE."""
+    """Train on normalized terms; record raw losses for interpretable progress."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -49,6 +67,7 @@ def main():
     parser.add_argument('--workers', type=int, default=0, help='prefetch worker processes; 0 loads synchronously with less RAM')
     parser.add_argument('--validation-batches', type=int, default=4, help='maximum validation batches; fixed clips without replacement')
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lpips-weight', type=float, default=0.2, help='frozen VGG LPIPS weight; 0 disables it')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--width', type=int, default=128)
     parser.add_argument('--depth', type=int, default=3)
@@ -59,6 +78,8 @@ def main():
         parser.error('batch/context/validation sizes, steps, depth and eval-every must be positive')
     if args.workers < 0 or args.seed < 0 or args.width < 8 or args.width % 8 or args.lr <= 0:
         parser.error('nonnegative workers/seed, positive lr and width divisible by 8 required')
+    if not np.isfinite(args.lpips_weight) or args.lpips_weight < 0:
+        parser.error('lpips-weight must be finite and nonnegative')
     checkpoint = args.output / 'last.pt'
     if not args.resume and args.output.exists() and any(args.output.iterdir()):
         parser.error('output must be empty for a new run; use --resume to continue')
@@ -84,13 +105,20 @@ def main():
         n_latents=4, bottleneck_dim=64, drop_rate=0., att_drop_rate=0.,
         mae_min_mask=0., mae_max_mask=0.)
     model = AutoEncoder(config).to(args.device).float()
+    perceptual = None
+    if args.lpips_weight:
+        import lpips
+        # Freeze the metric, not the gradient path from the loss to the tokenizer.
+        perceptual = lpips.LPIPS(net='vgg', version='0.1', verbose=False).to(args.device).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     start_step, history = 0, []
     if args.resume:
         saved = torch.load(checkpoint, map_location='cpu', weights_only=False)
+        assert saved.get('loss_normalization') == 'detached_abs_1e-8', 'Loss normalization changed; start a new run'
         assert saved['config'] == asdict(config), 'Model configuration changed'
         assert saved['arguments'].get('loss_patch_size', config.patch_size) == config.patch_size, 'Checkpoint loss patch size does not match the tokenizer patch size'
         assert saved['dataset_id'] == train_data.dataset_id, 'Dataset changed'
+        assert saved['arguments'].get('lpips_weight', 0.) == args.lpips_weight, 'LPIPS weight changed; start a new run'
         for key in ('context_size', 'temporal_attention', 'validation_batches', 'batch_size', 'lr', 'seed', 'device'):
             assert saved['arguments'].get(key) == vars(args)[key], f'{key} changed'
         model.load_state_dict(saved['model'])
@@ -123,7 +151,14 @@ def main():
         model.train()
         target = tensor(frames, args.device, args.temporal_attention)
         optimizer.zero_grad(set_to_none=True)
-        loss, mse = reconstruction_loss(model(target), target, config.patch_size)
+        prediction = model(target)
+        mse, worst_patch = reconstruction_losses(prediction, target, config.patch_size)
+        loss = normalize_loss(mse) + 0.1 * normalize_loss(worst_patch)
+        raw_loss = mse.detach() + 0.1 * worst_patch.detach()
+        if perceptual is not None:
+            lpips_value = perceptual_loss(perceptual, prediction, target)
+            loss = loss + args.lpips_weight * normalize_loss(lpips_value)
+            raw_loss = raw_loss + args.lpips_weight * lpips_value.detach()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
         optimizer.step()
@@ -131,16 +166,23 @@ def main():
             # Fixed validation clips, loaded batchwise. Weight a short last batch
             # by its pixel count, so this is MSE over all validation frames.
             model.eval()
-            squared_error, elements = 0., 0
+            squared_error, elements, perceptual_sum = 0., 0, 0.
             with torch.no_grad():
                 for val_frames, _ in val_loader:
                     val_target = tensor(val_frames, args.device, args.temporal_attention)
-                    squared_error += float((model(val_target) - val_target).square().sum())
+                    val_prediction = model(val_target)
+                    squared_error += float((val_prediction - val_target).square().sum())
+                    if perceptual is not None:
+                        perceptual_sum += float(perceptual_loss(perceptual, val_prediction, val_target)) * val_target.numel()
                     elements += val_target.numel()
-            record = dict(step=step, training_loss=float(loss.detach()), training_mse=float(mse.detach()), validation_mse=squared_error/elements)
+            record = dict(step=step, training_loss=float(raw_loss), training_mse=float(mse.detach()),
+                training_worst_patch_mse=float(worst_patch.detach()), validation_mse=squared_error/elements)
+            if perceptual is not None:
+                record.update(training_lpips=float(lpips_value.detach()), validation_lpips=perceptual_sum/elements)
             history.append(record)
             print(json.dumps(record, allow_nan=False), flush=True)
             saved = dict(config=asdict(config), arguments=vars(args), step=step,
+                loss_normalization='detached_abs_1e-8',
                 dataset_id=train_data.dataset_id, validation_clips=val_count,
                 model=model.state_dict(), optimizer=optimizer.state_dict(), history=history,
                 torch_rng=torch.get_rng_state(),

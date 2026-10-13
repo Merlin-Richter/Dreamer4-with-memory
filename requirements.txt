@@ -1,4 +1,5 @@
 torch>=2.4
+lpips==0.1.4
 matplotlib
 numpy
 h5py
