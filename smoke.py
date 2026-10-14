@@ -72,13 +72,13 @@ def main():
 
         dynamics.eval()
         with torch.no_grad():
-            tau, d = dynamics.sample_tau_d(2, 4, 'cpu')
+            tau = dynamics.sample_tau(2, 4, 'cpu')
             features = dynamics.action_features(clip_actions)
             torch.testing.assert_close(
-                dynamics(latents, tau, d, features)[:, :2],
-                dynamics(changed_latents, tau, d, features)[:, :2],
+                dynamics(latents, tau, features)[:, :2],
+                dynamics(changed_latents, tau, features)[:, :2],
             )
-            future = dynamics.generate(latents, n_generate=6, action_idx=actions)
+            future = dynamics.generate(latents, n_generate=6, K=4, action_idx=actions)
             assert future.shape == (2, 6, 4, 8)
             assert torch.isfinite(future).all()
             decoded = tokenizer.decoder(future[:, -4:])

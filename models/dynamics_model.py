@@ -1,27 +1,11 @@
-"""
-Dreamer 4 interactive dynamics model (Section 3.2).
+"""Vanilla causal dynamics on frozen tokenizer latents.
 
-The dynamics model operates on the sequence of continuous representations produced by the
-frozen tokenizer. For every frame it consumes
-``n_latents`` latent tokens of size ``bottleneck_dim`` and predicts the *clean* latents of
-that frame from a noised version of it, using its causal history as context. It is trained
-with a **shortcut forcing** objective: diffusion forcing (a per-frame signal level) combined
-with shortcut models (conditioning on the requested step size ``d``) so that frames can be
-sampled with as few as ``K = 4`` forward passes at inference.
+Dreamer 4-style spatial/temporal transformer, trained with ordinary flow matching
+in clean-latent (x-prediction) space. Each frame gets its own signal level
+(diffusion forcing). There are no shortcut targets or step-size embeddings.
 
-Key choices from the paper:
-  * x-prediction: the network predicts the clean latents ``z1`` (not the velocity), rather than predicting velocity.
-  * x-space flow loss at the finest step ``d_min = 1/max_sampling_steps``; bootstrap loss that
-    distills two ``d/2`` steps for the larger step sizes (Eq. 7).
-  * ramp loss weight ``w(tau) = 0.9*tau + 0.1`` to focus capacity on the high-signal levels.
-  * signal level ``tau`` and step size ``d`` are discrete, encoded with embedding lookups whose
-    channels are concatenated into a single shortcut token per frame.
-
-For unlabeled video the action modality is just a learned embedding (the "unlabeled video"
-case in the paper). For labeled data, set ``n_actions`` > 0: an embedding table maps each
-discrete action id to a per-frame feature added to that learned embedding. ``loss`` and
-``generate`` accept per-frame ``action_idx`` (the occluded-bouncing env emits curtain-state
-ids); ``forward`` takes the pre-computed action features.
+Inputs use the saved dataset convention: action[t] produced latent[t]. Temporal
+attention is causal; each prediction sees only its current noisy frame and past.
 """
 
 import torch
@@ -32,7 +16,7 @@ from dataclasses import dataclass
 @dataclass
 class DynamicsModelConfig():
 
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.float32
 
     # Must match the frozen tokenizer that produces the representations.
     bottleneck_dim: int = 64
@@ -45,8 +29,8 @@ class DynamicsModelConfig():
     mlp_ratio: float = 3.0
     depth: int = 8
 
-    drop_rate: float = 0.1
-    att_drop_rate: float = 0.1
+    drop_rate: float = 0.0
+    att_drop_rate: float = 0.0
     att_logit_soft_cap: float = 50
 
     n_action_tokens: int = 1
@@ -56,9 +40,9 @@ class DynamicsModelConfig():
     # used). >0 => a lookup table maps each discrete action id to a per-frame action feature.
     n_actions: int = 0
 
-    # Shortcut forcing schedule.
-    max_sampling_steps: int = 128   # K_max; finest step d_min = 1/K_max. Must be a power of two.
-    inference_steps: int = 4        # K used per frame at generation time (d = 1/K).
+    # Signal grid: tau in {0, 1/N, ..., (N-1)/N}. Sampling uses this same grid.
+    signal_levels: int = 128
+    inference_steps: int = 64
     context_signal: float = 0.9     # Context signal level during rollout: 1 = clean, 0 = noise.
     ramp_min: float = 0.1           # w(tau) = (1 - ramp_min) * tau + ramp_min.
 
@@ -111,7 +95,7 @@ class Attention(nn.Module):
 
         if not self.is_temporal:
             # Full self-attention within a frame: latents, registers, actions and the
-            # shortcut token all exchange information.
+            # signal-level token all exchange information.
             mask = None
         else:
             mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
@@ -173,10 +157,10 @@ class TransformerBlock(nn.Module):
 
 class DynamicsModel(nn.Module):
     """
-    Block-causal transformer that denoises per-frame latents via shortcut forcing.
+    Block-causal transformer that predicts clean latents from independently noised frames.
 
     Token layout per frame (along the spatial axis): ``[action tokens | latent tokens |
-    register tokens | shortcut token]``. Only the latent-token outputs are read out as the
+    register tokens | signal-level token]``. Only the latent-token outputs are read out as the
     x-prediction of the clean representation.
     """
 
@@ -189,9 +173,14 @@ class DynamicsModel(nn.Module):
         self.n_action_tokens = config.n_action_tokens
         self.n_registers = config.n_registers
 
-        self.K_max = config.max_sampling_steps
-        assert (self.K_max & (self.K_max - 1)) == 0, "max_sampling_steps must be a power of two"
-        self.n_d = self.K_max.bit_length()  # number of distinct step sizes: K in {1,2,...,K_max}
+        if config.depth < 4 or config.max_temporal_length < 2:
+            raise ValueError('Need depth >= 4 for temporal attention and context length >= 2')
+        if E < 1 or config.n_heads < 1 or E % (2 * config.n_heads):
+            raise ValueError('Width must be divisible by twice the head count for RoPE')
+        if config.signal_levels < 2 or config.inference_steps < 1 or config.signal_levels % config.inference_steps:
+            raise ValueError('Inference steps must be a positive divisor of signal_levels')
+        if not 0 <= config.context_signal < 1 or not 0 < config.ramp_min <= 1:
+            raise ValueError('Need context_signal in [0,1) and ramp_min in (0,1]')
 
         # Latent <-> model-dim projections. Latents are read out for the x-prediction.
         self.in_proj = nn.Linear(config.bottleneck_dim, E)
@@ -208,76 +197,59 @@ class DynamicsModel(nn.Module):
         if config.n_actions > 0:
             self.action_table = nn.Embedding(config.n_actions, config.n_action_tokens * E)
 
-        # Discrete shortcut conditioning: tau and d each get half the channels, concatenated.
-        assert E % 2 == 0
-        self.tau_embedding = nn.Embedding(self.K_max, E // 2)
-        self.d_embedding = nn.Embedding(self.n_d, E // 2)
+        self.tau_embedding = nn.Embedding(config.signal_levels, E)
 
         self.blocks = nn.ModuleList([
             TransformerBlock(config, is_temporal=((i + 1) % 4 == 0))
             for i in range(config.depth)
         ])
 
-    # ------------------------------------------------------------------ helpers
-    def _d_value(self, d_idx: torch.Tensor) -> torch.Tensor:
-        # d = 1 / K, with K = 2 ** d_idx.
-        return torch.pow(2.0, -d_idx.float())
+    def sample_tau(self, B, T, device, generator=None):
+        """Uniform, independent signal levels for each frame in each clip."""
+        return torch.randint(self.config.signal_levels, (B, T), device=device, generator=generator)
 
-    def _tau_value(self, tau_idx: torch.Tensor) -> torch.Tensor:
-        # tau grid points are integer multiples of d_min = 1 / K_max.
-        return tau_idx.float() / self.K_max
-
-    def sample_tau_d(self, B: int, T: int, device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample per-frame (tau_idx, d_idx) following Eq. 4.
-
-        d ~ 1/U({1, 2, ..., K_max})  ->  d_idx = log2(K) ~ U({0, ..., n_d-1}).
-        tau ~ U({0, d, 2d, ..., 1-d}) on the grid implied by the sampled d.
-        """
-        d_idx = torch.randint(0, self.n_d, (B, T), device=device)
-        K = torch.pow(2, d_idx)                               # steps for this frame
-        step = (torch.rand((B, T), device=device) * K).long()  # uniform in {0, ..., K-1}
-        step = torch.minimum(step, K - 1)
-        # tau_idx = step * (K_max / K), i.e. snap to the d_min grid.
-        tau_idx = step * torch.pow(2, self.n_d - 1 - d_idx)
-        return tau_idx, d_idx
+    def _tau_value(self, tau_idx):
+        return tau_idx.float() / self.config.signal_levels
 
     def action_features(self, action_idx: torch.Tensor) -> torch.Tensor:
         """(B, T) long action ids -> (B, T, n_action_tokens, E) feature tokens.
 
-        Returns ``None`` when the model is unlabeled or no ids are given, so callers can pass the
-        result straight through to ``forward`` (which then uses only the learned embedding).
+        Returns None for an unlabeled model. Action-conditioned models require ids.
         """
-        if action_idx is None or self.n_actions == 0:
+        if self.n_actions == 0:
             return None
+        if action_idx is None:
+            raise ValueError('This model requires aligned action ids')
         B, T = action_idx.shape
         return self.action_table(action_idx).reshape(B, T, self.n_action_tokens, -1)
 
     # ------------------------------------------------------------------ forward
-    def forward(self, z_tilde: torch.Tensor, tau_idx: torch.Tensor, d_idx: torch.Tensor,
+    def forward(self, z_tilde: torch.Tensor, tau_idx: torch.Tensor,
                 actions: torch.Tensor = None) -> torch.Tensor:
         """Predict clean latents (x-prediction) from noised latents.
 
         z_tilde:  (B, T, n_latents, bottleneck_dim) noised representations.
         tau_idx:  (B, T) long, discrete signal level per frame.
-        d_idx:    (B, T) long, discrete step size per frame.
         actions:  optional (B, T, n_action_tokens, E) action features to add to the learned
                   action embedding. ``None`` => unlabeled video.
         returns:  (B, T, n_latents, bottleneck_dim) predicted clean latents.
         """
         B, T, L, _ = z_tilde.shape
+        if T > self.config.max_temporal_length:
+            raise ValueError('Input exceeds the model context length')
+        if self.n_actions and actions is None:
+            raise ValueError('This model requires action features')
 
         lat = self.in_proj(z_tilde)  # (B, T, L, E)
 
-        shortcut = torch.concat(
-            (self.tau_embedding(tau_idx), self.d_embedding(d_idx)), dim=-1
-        ).unsqueeze(2)  # (B, T, 1, E)
+        signal = self.tau_embedding(tau_idx).unsqueeze(2)  # (B, T, 1, E)
 
         action = self.action_embedding.expand(B, T, -1, -1)
         if actions is not None:
             action = action + actions
         register = self.register_tokens.expand(B, T, -1, -1)
 
-        x = torch.concat((action, lat, register, shortcut), dim=2)  # (B, T, N, E)
+        x = torch.concat((action, lat, register, signal), dim=2)  # (B, T, N, E)
 
         for block in self.blocks:
             x = block(x)
@@ -287,116 +259,64 @@ class DynamicsModel(nn.Module):
         x = self.out_norm(x)
         return self.out_proj(x)
 
-    # ------------------------------------------------------------------ loss
-    def loss(self, z1: torch.Tensor, action_idx: torch.Tensor = None) -> torch.Tensor:
-        """Shortcut forcing loss over a clip of clean representations.
+    def loss(self, z1: torch.Tensor, action_idx: torch.Tensor = None, generator=None):
+        """Ramp-weighted clean-latent MSE; one forward pass per update.
 
-        z1:         (B, T, n_latents, bottleneck_dim) clean tokenizer latents.
-        action_idx: optional (B, T) long discrete action ids, aligned per frame.
+        z1: (B,T,N,D) clean latents; action_idx: (B,T) aligned action ids.
+        An optional generator makes validation noise repeatable without consuming
+        the training RNG. This is a denoising objective, not rollout accuracy.
         """
-        B, T, L, _ = z1.shape
-        device = z1.device
-        actions = self.action_features(action_idx)
+        B, T, _, _ = z1.shape
+        tau_idx = self.sample_tau(B, T, z1.device, generator)
+        tau = self._tau_value(tau_idx)[..., None, None]
+        noise = torch.randn(z1.shape, device=z1.device, dtype=z1.dtype, generator=generator)
+        noisy = (1 - tau) * noise + tau * z1
+        prediction = self(noisy, tau_idx, self.action_features(action_idx))
+        weight = (1 - self.config.ramp_min) * tau + self.config.ramp_min
+        return (weight * (prediction - z1).square()).mean()
 
-        tau_idx, d_idx = self.sample_tau_d(B, T, device)
-        tau = self._tau_value(tau_idx)[..., None, None]  # (B, T, 1, 1)
-        d = self._d_value(d_idx)[..., None, None]
-
-        z0 = torch.randn_like(z1)
-        z_tilde = (1 - tau) * z0 + tau * z1
-
-        z_hat1 = self(z_tilde, tau_idx, d_idx, actions)  # x-prediction (with gradient)
-
-        is_min = (d_idx == self.n_d - 1)[..., None, None]  # finest step => pure flow loss
-
-        # --- bootstrap targets: distill two d/2 steps (Eq. 7), stop-gradient. ---
-        with torch.no_grad():
-            half_d_idx = (d_idx + 1).clamp(max=self.n_d - 1)
-            half_d = self._d_value(half_d_idx)[..., None, None]
-            # tau + d/2 on the d_min grid; clamp keeps masked (is_min) entries in range.
-            tau_inc = torch.pow(2, (self.n_d - 2 - d_idx).clamp(min=0))
-            tau2_idx = (tau_idx + tau_inc).clamp(max=self.K_max - 1)
-            tau2 = self._tau_value(tau2_idx)[..., None, None]
-
-            y1 = self(z_tilde, tau_idx, half_d_idx, actions)
-            b1 = (y1 - z_tilde) / (1 - tau)
-            z_prime = z_tilde + b1 * half_d
-
-            y2 = self(z_prime, tau2_idx, half_d_idx, actions)
-            b2 = (y2 - z_prime) / (1 - tau2)
-
-            v_target = (b1 + b2) / 2
-
-        flow_loss = (z_hat1 - z1) ** 2
-        v_pred = (z_hat1 - z_tilde) / (1 - tau)
-        boot_loss = (1 - tau) ** 2 * (v_pred - v_target) ** 2
-
-        per_token = torch.where(is_min, flow_loss, boot_loss)
-
-        w = (1 - self.config.ramp_min) * tau + self.config.ramp_min  # ramp weight, Eq. 8
-        return (w * per_token).mean()
-
-    # ------------------------------------------------------------------ rollout
     @torch.no_grad()
-    def _denoise_next(self, context: torch.Tensor, K: int,
-                      actions: torch.Tensor = None) -> torch.Tensor:
-        """Generate one clean frame conditioned on ``context`` (clean latents), using K
-        shortcut steps. ``context`` is held at signal level tau_ctx (=context_signal,
-        near 1.0 = near-clean).
-
-        actions: optional (B, T_ctx + 1, n_action_tokens, E) action features covering the
-                 context frames and the new frame being generated.
-        """
-        B, T_ctx, L, _ = context.shape
-        device = context.device
-        d_val = 1.0 / K
-        d_idx_val = (K).bit_length() - 1  # log2(K)
-
-        tau_ctx = self.config.context_signal
-        tau_ctx_idx = round(tau_ctx * self.K_max)
-        # Hold the (clean) context at signal level tau_ctx for this frame's sampling:
-        # ctx = tau_ctx * context + (1 - tau_ctx) * noise. High tau_ctx => near-clean.
-        ctx_noised = (1 - tau_ctx) * torch.randn_like(context) + tau_ctx * context
-
-        d_col = torch.full((B, T_ctx + 1), d_idx_val, device=device, dtype=torch.long)
-        tau_col = torch.full((B, T_ctx + 1), tau_ctx_idx, device=device, dtype=torch.long)
-
-        z = torch.randn((B, 1, L, self.bottleneck_dim), device=device)  # pure noise, tau = 0
+    def _denoise_next(self, context, K, actions=None):
+        """Euler integration from noise to a new frame, holding noisy history fixed."""
+        B, T, L, _ = context.shape
+        levels = self.config.signal_levels
+        ctx_idx = min(round(self.config.context_signal * levels), levels - 1)
+        ctx_tau = ctx_idx / levels
+        history = ctx_tau * context + (1 - ctx_tau) * torch.randn_like(context)
+        tau_idx = torch.full((B, T + 1), ctx_idx, device=context.device, dtype=torch.long)
+        z = torch.randn((B, 1, L, self.bottleneck_dim), device=context.device, dtype=context.dtype)
         for k in range(K):
+            tau_idx[:, -1] = k * (levels // K)
             tau = k / K
-            tau_col[:, -1] = round(tau * self.K_max)
-            inp = torch.concat((ctx_noised, z), dim=1)
-            z_hat1 = self(inp, tau_col, d_col, actions)[:, -1:]  # x-prediction for the new frame
-            v = (z_hat1 - z) / (1 - tau)
-            z = z + v * d_val
-        return z  # (B, 1, L, bottleneck_dim)
+            clean = self(torch.cat((history, z), dim=1), tau_idx, actions)[:, -1:]
+            velocity = (clean - z) / (1 - tau)
+            z = z + velocity / K
+        return z
 
     @torch.no_grad()
-    def generate(self, context: torch.Tensor, n_generate: int, K: int = None,
-                 action_idx: torch.Tensor = None) -> torch.Tensor:
-        """Autoregressively roll out ``n_generate`` frames after ``context``.
+    def generate(self, context, n_generate, K=None, action_idx=None):
+        """Predict future latents from a prefix and the supplied future actions.
 
-        context:    (B, T_ctx, n_latents, bottleneck_dim) clean latents from the tokenizer.
-        action_idx: optional (B, T_ctx + n_generate) long action ids for every frame in the
-                    context and the frames to generate (required when the model is action
-                    conditioned, so the curtain state of each generated frame is known).
-        returns:    (B, n_generate, n_latents, bottleneck_dim) generated clean latents.
+        context: (B,T,N,D); action_idx: (B,T+n_generate), including prefix actions.
+        K is the number of Euler steps per frame; it must divide signal_levels.
+        At most max_temporal_length-1 past frames condition each new frame.
         """
-        K = K or self.config.inference_steps
-        max_ctx = self.config.max_temporal_length - 1
-        T_ctx = context.shape[1]
-        act_feat = self.action_features(action_idx)  # (B, T_total, n_act, E) or None
-        seq = context
+        K = self.config.inference_steps if K is None else K
+        if not isinstance(K, int) or K < 1 or self.config.signal_levels % K:
+            raise ValueError('K must be a positive divisor of signal_levels')
+        if n_generate < 1:
+            raise ValueError('n_generate must be positive')
+        B, T = context.shape[:2]
+        if self.n_actions and (action_idx is None or action_idx.shape != (B, T + n_generate)):
+            raise ValueError('Supply actions for the full prefix and generated sequence')
+        features = self.action_features(action_idx)
+        sequence = context
         generated = []
         for i in range(n_generate):
-            window = seq[:, -max_ctx:]
-            w = window.shape[1]
-            new_idx = T_ctx + i               # absolute index of the frame being generated
-            act_window = None
-            if act_feat is not None:
-                # action features for [window frames ... new frame], matching _denoise_next input
-                act_window = act_feat[:, new_idx - w : new_idx + 1]
-            nxt = self._denoise_next(window, K, act_window)
-            generated.append(nxt)
-            seq = torch.concat((seq, nxt), dim=1)
-        return torch.concat(generated, dim=1)
+            window = sequence[:, -(self.config.max_temporal_length - 1):]
+            end = T + i
+            actions = None if features is None else features[:, end - window.shape[1]:end + 1]
+            next_frame = self._denoise_next(window, K, actions)
+            generated.append(next_frame)
+            sequence = torch.cat((sequence, next_frame), dim=1)
+        return torch.cat(generated, dim=1)
