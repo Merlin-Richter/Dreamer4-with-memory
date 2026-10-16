@@ -124,7 +124,53 @@ weight for a short last batch. Checkpoints contain the model, optimizer, RNG
 states, settings, latent dataset ID, source pixel dataset ID, and tokenizer hash.
 Only `last.pt` is retained. Resume with the same command plus `--resume`.
 
-The existing `generate` method uses Euler integration with 64 steps per frame by
-default. Supported step counts divide 128, including 8, 16, 32, and 64. These
-choices still need evaluation; a lower denoising loss alone does not establish
-rollout quality. The memory trainer and rollout figure scripts are separate work.
+The rollout and evaluation scripts default to 16 Euler steps per frame, overriding
+the older vanilla checkpoint's 64-step setting. Supported step counts divide 128,
+including 8, 16, 32, and 64. A lower denoising loss alone does not establish rollout
+quality; use the visual and quantitative checks in [paper_figures](../paper_figures/README.md).
+
+## State-stream dynamics: first stage
+
+The next model routes all temporal information through dedicated state tokens.
+Train this stream before learning its compression. The implementation and trainer
+are separate from the vanilla version: `models/state_dynamics_model.py` and
+`training/train_state_dynamics.py`.
+
+Each frame contains action, latent, register, signal-level, and four state tokens.
+Spatial attention lets these tokens interact within their own frame. Only the
+state tokens enter temporal attention, causally reading their past state stream.
+Other tokens pass through a temporal block unchanged. Four-block groups use
+**spatial → spatial → temporal-state → spatial**, so predictions can read the
+updated state before being decoded. The vanilla model uses spatial → spatial →
+spatial → temporal; both have three temporal blocks at depth 12.
+
+```sh
+python -m training.train_state_dynamics \
+  --data data/cards_latents.h5 --output runs/state_dynamics_cards \
+  --num-actions 17 --device cuda --batch-size 32 --context-size 16 \
+  --width 256 --depth 12 --state-tokens 4 --steps 200000 --workers 0 --seed 4
+```
+
+These settings match the width, depth, batch size, context, seed and update count
+of the trained 200,000-step vanilla run. They are a starting point for this new
+architecture, not an established convergence recipe. At this size, the baseline
+has 10,335,680 parameters and the state-stream model has 10,336,704. The added
+1,024 parameters initialise the four state tokens. Compute and activation memory
+differ because spatial blocks process more tokens and temporal blocks process
+fewer; equal update counts do not imply equal compute.
+
+The flow-matching objective, optimizer, validation, checkpointing, and `--resume`
+behavior are the same as the baseline. There is one loss and no compression loss
+yet. `--state-tokens` controls the channel size; `--depth` must be a multiple of
+four. For a fresh baseline comparison, use the same training settings in both
+trainers.
+
+Use the existing rollout and quantitative commands with
+`--checkpoint runs/state_dynamics_cards/last.pt` and the same tokenizer. They
+detect the architecture from the checkpoint. Choose separate output paths to
+retain the baseline results.
+
+This stage still rebuilds its state tokens from the finite context window; it
+does not yet retain a compressed state beyond that window. First verify that
+prediction works through this state channel. Learning persistent compression of
+the channel is the next stage.

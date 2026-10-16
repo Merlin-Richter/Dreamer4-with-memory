@@ -284,14 +284,17 @@ whether generated cards retain the correct identities over long rollouts.
 Repeat the command with `--resume` to continue; `--steps` is the total update count.
 
 The settings above are an initial run, not yet a measured convergence or runtime
-recipe. Rollout inspection and memory evaluation are the next separate steps.
+recipe. Continue with the [scripted rollout and memory evaluations](paper_figures/README.md)
+to see what the model predicts and how its recall changes with delay.
 
 ## What comes next
 
 These stages are still under development:
 
-1. Implement and train the version with memory on the same cache as the baseline.
-2. Construct scripted evaluation episodes with controlled periods of hidden information.
-3. Compare generated rollouts visually and plot card-identity accuracy against rollout length.
+1. Train the [state-stream model](training/README.md#state-stream-dynamics-first-stage)
+   on the same cache: only its state tokens attend across time.
+2. Verify its predictions with the same visual and quantitative evaluations.
+3. Learn compression of the trained state stream, then compare recall beyond the
+   original context window.
 4. Add the two-card matching test.
 
