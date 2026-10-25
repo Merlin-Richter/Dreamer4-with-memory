@@ -162,19 +162,23 @@ class LongContextDynamicsModel(nn.Module):
         self.out_norm = nn.RMSNorm(config.width)
         self.latent_out = nn.Linear(config.width, config.latent_dim)
 
-    def forward(self, latents, tau, actions):
+    def _tokens(self, latents, tau, actions):
+        batch, length = latents.shape[:2]
+        step = torch.full_like(tau, self.step_embedding.num_embeddings - 1)
+        signal = torch.cat((self.tau_embedding(tau), self.step_embedding(step)), -1)
+        return torch.cat((self.latent_in(latents) + self.latent_slots,
+                          self.registers.expand(batch, length, -1, -1),
+                          self.action_embedding(actions)[:, :, None], signal[:, :, None],
+                          self.state_token.expand(batch, length, -1, -1)), 2)
+
+    def forward(self, latents, tau, actions, *, return_cache=False):
         """(B,T,N,D) noisy latents + (B,T) signal/action ids -> clean latents."""
         batch, length = latents.shape[:2]
         if not 1 <= length <= self.config.max_temporal_length:
             raise ValueError('Input length must be within the configured context')
         if tau.shape != (batch, length) or actions.shape != (batch, length):
             raise ValueError('Supply one signal level and aligned action per frame')
-        step = torch.full_like(tau, self.step_embedding.num_embeddings - 1)
-        signal = torch.cat((self.tau_embedding(tau), self.step_embedding(step)), -1)
-        x = torch.cat((self.latent_in(latents) + self.latent_slots,
-                       self.registers.expand(batch, length, -1, -1),
-                       self.action_embedding(actions)[:, :, None], signal[:, :, None],
-                       self.state_token.expand(batch, length, -1, -1)), 2)
+        x = self._tokens(latents, tau, actions)
         tokens = x.shape[2]
         positions = torch.arange(1, length + 1, device=x.device)[None].expand(batch, -1)
         backend = ('flex' if x.is_cuda else 'dense') if self.backend == 'auto' else self.backend
@@ -194,12 +198,52 @@ class LongContextDynamicsModel(nn.Module):
             self._mask_key = key
         # Keep the mask local: a later forward must not change recomputation.
         mask = self._mask
+        cache = []
         for block in self.blocks:
+            if return_cache:
+                att = block.attention
+                k, v = att.kv(block.norm1(x[:, :, -1])).chunk(2, -1)
+                cache.append((att._rope(att.k_norm(att._heads(k)), positions), att._heads(v)))
             if self.training and self.recompute:
                 x = checkpoint(block, x, positions, mask, backend, use_reentrant=False)
             else:
                 x = block(x, positions, mask, backend)
-        return self.latent_out(self.out_norm(x[:, :, :self.n_latents]))
+        prediction = self.latent_out(self.out_norm(x[:, :, :self.n_latents]))
+        return (prediction, cache) if return_cache else prediction
+
+    def _cached_frame(self, latent, tau, action, cache):
+        """Read past state K/V and this frame; return a candidate updated cache.
+
+        Denoising queries discard the candidate. Only a separate clean-frame
+        pass is committed, so noisy queries never contaminate future history.
+        """
+        x = self._tokens(latent, tau, action)
+        batch, _, tokens, width = x.shape
+        past = cache[0][0].shape[2] if cache else 0
+        positions = torch.full((batch, tokens), past + 1, device=x.device)
+        updated = []
+        for i, block in enumerate(self.blocks):
+            att = block.attention
+            norm = block.norm1(x[:, 0])
+            q = att._rope(att.q_norm(att._heads(att.q(norm))), positions)
+            k, v = att.kv(torch.cat((norm[:, -1:], norm[:, :-1]), 1)).chunk(2, -1)
+            k = att._rope(att.k_norm(att._heads(k)), positions)
+            v = att._heads(v)
+            state_k, state_v = k[:, :, :1], v[:, :, :1]
+            if cache:
+                old_k, old_v = cache[i]
+                state_k, state_v = torch.cat((old_k, state_k), 2), torch.cat((old_v, state_v), 2)
+                k, v = torch.cat((old_k, k), 2), torch.cat((old_v, v), 2)
+            updated.append((state_k, state_v))
+            scale = att.logit_scale.float().clamp(max=math.log(100.)).exp()[None]
+            q = (q.float() * scale).to(q.dtype)
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                scores = q.float() @ k.float().transpose(-2, -1) / math.sqrt(att.head_dim)
+                weights = softcap(scores, None, None, None, None).softmax(-1)
+                read = (weights @ v.float()).to(v.dtype)
+            x = x + att.out(read.transpose(1, 2).flatten(2)).reshape(batch, 1, tokens, width)
+            x = x + block.mlp(block.norm2(x))
+        return self.latent_out(self.out_norm(x[:, :, :self.n_latents])), updated
 
     def loss(self, clean, actions, generator=None):
         """Research recipe: 50% clean, 25% noise, 25% intermediate per frame.
@@ -227,6 +271,8 @@ class LongContextDynamicsModel(nn.Module):
 
         K=1 reproduces the research noise-to-clean query; K=16 is the repo's
         inspection default. No hidden state survives outside the retained history.
+        Clean-history state K/V are reused across denoising steps. The cache is
+        rebuilt from retained frames whenever the window slides.
         """
         K = self.config.inference_steps if K is None else K
         if not isinstance(K, int) or not 1 <= K <= 127 or n_generate < 1:
@@ -235,18 +281,27 @@ class LongContextDynamicsModel(nn.Module):
         if action_idx is None or action_idx.shape != (batch, prefix + n_generate):
             raise ValueError('Supply actions for the full prefix and generated sequence')
         schedule = [round(k * 127 / K) for k in range(K + 1)]
-        sequence, generated = context, []
+        sequence, generated, cache = context, [], []
         for i in range(n_generate):
             history = sequence[:, -(self.config.max_temporal_length - 1):]
             end = prefix + i
             actions = action_idx[:, end - history.shape[1]:end + 1]
-            tau = torch.full_like(actions, 127)
+            cached_length = cache[0][0].shape[2] if cache else 0
+            if cached_length != history.shape[1]:
+                # Rebuild after sliding the window. Merely dropping old K/V
+                # would relay information from frames outside the allowed history.
+                _, cache = self(history, torch.full_like(actions[:, :-1], 127),
+                                actions[:, :-1], return_cache=True)
+            action = actions[:, -1:]
+            tau = torch.zeros_like(action)
             z = torch.randn((batch, 1, self.n_latents, self.bottleneck_dim),
                             device=context.device, dtype=context.dtype)
             for start, stop in zip(schedule[:-1], schedule[1:]):
                 tau[:, -1] = start
-                clean = self(torch.cat((history, z), 1), tau, actions)[:, -1:]
+                clean, _ = self._cached_frame(z, tau, action, cache)
                 z = z + (clean - z) * ((stop - start) / (127 - start))
             generated.append(z)
             sequence = torch.cat((sequence, z), 1)
+            if i + 1 < n_generate:
+                _, cache = self._cached_frame(z, torch.full_like(action, 127), action, cache)
         return torch.cat(generated, 1)
