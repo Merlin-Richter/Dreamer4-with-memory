@@ -1,9 +1,8 @@
 """Train bounded memory readers/writers on a frozen long-context state backbone.
 
-Real cached trajectories are unrolled through successive blocks, without
-detaching memory. The frozen parent supplies optional prediction targets only.
-Loss terms are independently divided by detached absolute magnitude; logged
-MSEs and checkpoint selection use raw, interpretable prediction errors.
+Train readers/writers to match the parent's historical attention values and
+log-normalizers. Full gradients cross block boundaries; the backbone is frozen.
+Prediction errors are logged separately and do not enter the objective.
 """
 import argparse
 from dataclasses import asdict
@@ -20,53 +19,24 @@ from torch.utils.data import DataLoader, Subset
 
 from data_generation.episode_dataset import RandomClipBatches
 from data_generation.episode_latent_dataset import EpisodeLatentClips
-from models.long_context_dynamics_model import LongContextDynamicsConfig, LongContextDynamicsModel
+from models.long_context_dynamics_model import LongContextDynamicsConfig
 from models.recurrent_dynamics_model import RecurrentDynamicsModel
 
 
-def normalized_loss(value):
-    return value / value.detach().abs().clamp_min(1e-8)
-
-
-def losses(model, teacher, clean, actions, teacher_weight=.1, generator=None):
-    """Same corruption for parent/student; clean frames are context, not targets."""
-    shape, device = clean.shape[:2], clean.device
-    mixture = torch.rand(shape, device=device, generator=generator)
-    middle = torch.randint(1, 127, shape, device=device, generator=generator)
-    tau = torch.where(mixture < .5, 127, torch.where(mixture < .75, 0, middle))
-    noise = torch.randn(clean.shape, device=device, generator=generator)
-    amount = tau.float()[..., None, None] / 127
-    noisy = amount * clean + (1 - amount) * noise
-    mask = tau < 127
-    def mse(prediction, target):
-        error = (prediction.float() - target.float()).square().mean((-1, -2))
-        return (error * mask).sum() / mask.sum().clamp_min(1)
-    # Only teacher targets are detached. Frozen student backbone operations
-    # must remain in the autograd graph so future errors can train earlier writes.
-    if teacher_weight:
-        with torch.no_grad():
-            target = teacher(noisy, tau, actions)
-    prediction = model(noisy, tau, actions)
-    observation = mse(prediction, clean)
-    distillation = mse(prediction, target) if teacher_weight else observation.new_zeros(())
-    objective = normalized_loss(observation) + teacher_weight * normalized_loss(distillation)
-    return objective, observation, distillation
-
-
 @torch.no_grad()
-def validate(model, teacher, loader, device, teacher_weight):
+def validate(model, loader, device, lse_weight):
     model.eval()
     generator = torch.Generator(device=device).manual_seed(10002)
-    total = np.zeros(2)
-    count = 0
+    total, count = {}, 0
     for latents, actions in loader:
         latents = latents.to(device, non_blocking=device == 'cuda')
         actions = actions.to(device, torch.long, non_blocking=device == 'cuda')
         with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == 'cuda'):
-            _, observation, distillation = losses(model, teacher, latents, actions, teacher_weight, generator)
-        total += np.array([float(observation), float(distillation)]) * latents.shape[0]
+            _, metrics = model.distill_loss(latents, actions, generator, lse_weight=lse_weight)
+        for key, value in metrics.items():
+            total[key] = total.get(key, 0.) + float(value) * latents.shape[0]
         count += latents.shape[0]
-    return dict(validation_mse=total[0] / count, validation_teacher_mse=total[1] / count)
+    return {f'validation_{key}': value / count for key, value in total.items()}
 
 
 def main():
@@ -80,7 +50,7 @@ def main():
     parser.add_argument('--context-size', type=int, default=256, help='training unroll; not an inference memory limit')
     parser.add_argument('--block-size', type=int, default=16)
     parser.add_argument('--memory-slots', type=int, default=16, help='persistent vectors per layer')
-    parser.add_argument('--teacher-weight', type=float, default=.1, help='weight on separately normalized teacher MSE; 0 disables it')
+    parser.add_argument('--lse-weight', type=float, default=1., help='weight on squared attention log-normalizer error')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--workers', type=int, default=0)
     parser.add_argument('--validation-batches', type=int, default=4)
@@ -94,8 +64,8 @@ def main():
     if args.context_size % args.block_size or args.context_size < 2 * args.block_size:
         parser.error('training context must contain at least two complete blocks')
     if (args.workers < 0 or args.seed < 0 or not np.isfinite(args.lr) or args.lr <= 0
-            or not np.isfinite(args.teacher_weight) or args.teacher_weight < 0):
-        parser.error('need nonnegative workers/seed/teacher-weight and a finite positive learning rate')
+            or not np.isfinite(args.lse_weight) or args.lse_weight < 0):
+        parser.error('need nonnegative workers/seed/lse-weight and a finite positive learning rate')
     if args.device == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
         parser.error('CUDA training requires a BF16-capable GPU allocation')
     checkpoint = args.output / 'last.pt'
@@ -126,24 +96,20 @@ def main():
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    teacher = LongContextDynamicsModel(config, recompute=False).to(args.device).float().eval()
-    teacher.load_state_dict(parent['model'])
-    teacher.requires_grad_(False)
     model = RecurrentDynamicsModel(config, block_size=args.block_size, memory_slots=args.memory_slots).to(args.device).float()
     model.initialize(parent['model'])
     del parent
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=.01)
-    start_step, history, best_mse, elapsed_before = 0, [], float('inf'), 0.
+    start_step, history, best_loss, elapsed_before = 0, [], float('inf'), 0.
     if args.resume:
         saved = torch.load(checkpoint, map_location='cpu', weights_only=False)
         if (saved.get('architecture') != 'recurrent_state_v1'
-                or saved.get('objective') != 'normalized_denoising_distillation_v1'
-                or saved.get('loss_normalization') != 'detached_abs_1e-8'
+                or saved.get('objective') != 'attention_distillation_v1'
                 or saved['config'] != asdict(config) or saved['parent_sha256'] != parent_sha256
                 or saved['dataset_id'] != train_data.dataset_id):
             parser.error('resume model, objective, parent or dataset changed')
-        for key in ('batch_size', 'context_size', 'block_size', 'memory_slots', 'teacher_weight',
+        for key in ('batch_size', 'context_size', 'block_size', 'memory_slots', 'lse_weight',
                     'validation_batches', 'lr', 'seed', 'device'):
             if saved['arguments'][key] != vars(args)[key]:
                 parser.error(f'{key} changed since the checkpoint')
@@ -152,7 +118,7 @@ def main():
         torch.set_rng_state(saved['torch_rng'])
         if args.device == 'cuda':
             torch.cuda.set_rng_state_all(saved['cuda_rng'])
-        start_step, history, best_mse = saved['step'], saved['history'], saved['best_validation_mse']
+        start_step, history, best_loss = saved['step'], saved['history'], saved['best_validation_loss']
         elapsed_before = history[-1]['elapsed_seconds']
         del saved
         if args.steps <= start_step:
@@ -177,8 +143,8 @@ def main():
           f'{args.memory_slots} slots/layer; {memory_bytes / 1024:g} KiB persistent memory/episode (FP32).', flush=True)
     print(f'{sum(p.numel() for p in trainable):,} trainable reader/writer parameters; backbone and teacher frozen. '
           'Full recurrent gradients, block activation recomputation; no detached memory.', flush=True)
-    print(f'Loss: normalize(prediction MSE) + {args.teacher_weight:g} × normalize(teacher MSE); '
-          'normalize(x)=x/stopgrad(max(abs(x),1e-8)). Logs and best.pt use raw MSE.', flush=True)
+    print(f'Loss: attention value error + {args.lse_weight:g} × LSE error; '
+          'summed over layers, averaged over blocks with memory. best.pt uses validation loss.', flush=True)
     stop_requested = False
     def request_stop(signum, frame):
         nonlocal stop_requested
@@ -192,27 +158,26 @@ def main():
         actions = actions.to(args.device, torch.long, non_blocking=args.device == 'cuda')
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.device == 'cuda'):
-            loss, observation, distillation = losses(model, teacher, latents, actions, args.teacher_weight)
+            loss, metrics = model.distill_loss(latents, actions, lse_weight=args.lse_weight)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, 1., error_if_nonfinite=True)
         optimizer.step()
         if step == 1 or step % args.eval_every == 0 or step == args.steps or stop_requested:
-            record = dict(step=step, training_mse=float(observation.detach()),
-                training_teacher_mse=float(distillation.detach()), grad_norm=float(grad_norm),
-                **validate(model, teacher, val_loader, args.device, args.teacher_weight),
+            record = dict(step=step, **{f'training_{key}': float(value) for key, value in metrics.items()},
+                grad_norm=float(grad_norm), **validate(model, val_loader, args.device, args.lse_weight),
                 elapsed_seconds=elapsed_before + time.perf_counter() - started)
             if args.device == 'cuda':
                 record['peak_vram_gib'] = torch.cuda.max_memory_allocated() / 2**30
             print(json.dumps(record, allow_nan=False), flush=True)
             history.append(record)
-            improved = record['validation_mse'] < best_mse
-            best_mse = min(best_mse, record['validation_mse'])
+            improved = record['validation_distillation_loss'] < best_loss
+            best_loss = min(best_loss, record['validation_distillation_loss'])
             saved = dict(config=asdict(config), arguments=vars(args), step=step,
-                architecture='recurrent_state_v1', objective='normalized_denoising_distillation_v1',
-                loss_normalization='detached_abs_1e-8', parent_sha256=parent_sha256,
+                architecture='recurrent_state_v1', objective='attention_distillation_v1',
+                parent_sha256=parent_sha256,
                 dataset_id=train_data.dataset_id, source_dataset_id=train_data.source_dataset_id,
                 tokenizer_sha256=train_data.checkpoint_sha256, validation_clips=val_count,
-                memory_bytes_fp32=memory_bytes, best_validation_mse=best_mse,
+                memory_bytes_fp32=memory_bytes, best_validation_loss=best_loss,
                 torch_version=str(torch.__version__), precision='bf16' if args.device == 'cuda' else 'float32',
                 model=model.state_dict(), optimizer=optimizer.state_dict(), history=history,
                 torch_rng=torch.get_rng_state(),

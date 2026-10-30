@@ -28,7 +28,7 @@ srun python -u -m training.train_recurrent_dynamics \
   --context-size 256 \
   --block-size 16 \
   --memory-slots 16 \
-  --teacher-weight 0.1 \
+  --lse-weight 1.0 \
   --steps 10000 \
   --workers 0 \
   --eval-every 250 \

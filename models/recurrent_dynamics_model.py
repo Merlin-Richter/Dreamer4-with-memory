@@ -87,7 +87,7 @@ class RecurrentDynamicsModel(nn.Module):
         self.config, self.block_size, self.memory_slots = config, block_size, memory_slots
         self.recompute = recompute
         self.n_latents, self.bottleneck_dim, self.n_actions = config.n_latents, config.latent_dim, config.n_actions
-        self.backbone = LongContextDynamicsModel(config, backend='dense', recompute=False)
+        self.backbone = LongContextDynamicsModel(config, recompute=False)
         self.backbone.requires_grad_(False)
         self.writers = nn.ModuleList([StateWriter(config.width, memory_slots) for _ in range(config.depth)])
         self.readers = nn.ModuleList([MemoryReader(b.attention) for b in self.backbone.blocks])
@@ -98,8 +98,9 @@ class RecurrentDynamicsModel(nn.Module):
             for name in ('q', 'kv', 'q_norm', 'k_norm'):
                 getattr(reader, name).load_state_dict(getattr(block.attention, name).state_dict())
 
-    def chunk(self, latents, tau, actions, memory, start, write_memory=True):
-        """Read fixed old memory and causal local states; optionally write a new bank."""
+    def chunk(self, latents, tau, actions, memory, start, write_memory=True,
+              teacher_cache=None, lse_weight=1.):
+        """Return predictions, memory, attention loss and its two unweighted terms."""
         batch, length = latents.shape[:2]
         if not 1 <= length <= self.block_size or tau.shape != (batch, length) or actions.shape != tau.shape:
             raise ValueError('Need one aligned signal/action per frame within a single block')
@@ -112,6 +113,8 @@ class RecurrentDynamicsModel(nn.Module):
         index = torch.arange(length * tokens, device=x.device)
         allowed = visibility(length, tokens)(None, None, index[:, None], index[None])
         updated = []
+        value_loss = x.new_zeros((), dtype=torch.float32)
+        lse_loss = x.new_zeros((), dtype=torch.float32)
         for i, block in enumerate(model.blocks):
             norm, raw, att = block.norm1(x), x[:, :, -1], block.attention
             flat = norm.flatten(1, 2)
@@ -132,6 +135,18 @@ class RecurrentDynamicsModel(nn.Module):
                 if old is not None:
                     historical = softcap(mq.float() @ mk.float().transpose(-2, -1) / math.sqrt(att.head_dim),
                                          None, None, None, None) + mass
+                    if teacher_cache is not None:
+                        # The target uses the student's backbone query, not its reader query.
+                        # Detach the entire target, including this query's dependence on memory.
+                        with torch.no_grad():
+                            old_k, old_v = teacher_cache[i]
+                            old_scores = softcap(q.float() @ old_k[:, :, :start].float().transpose(-2, -1)
+                                                 / math.sqrt(att.head_dim), None, None, None, None)
+                            old_lse = old_scores.logsumexp(-1)
+                            old_read = old_scores.softmax(-1) @ old_v[:, :, :start].float()
+                        memory_read = historical.softmax(-1) @ mv.float()
+                        value_loss = value_loss + (memory_read - old_read).square().sum(-1).mean()
+                        lse_loss = lse_loss + (historical.logsumexp(-1) - old_lse).square().mean()
                     scores = torch.cat((historical, scores), -1)
                     values = torch.cat((mv.float(), values), 2)
                 read = scores.softmax(-1) @ values
@@ -140,7 +155,8 @@ class RecurrentDynamicsModel(nn.Module):
             if write_memory:
                 updated.append(self.writers[i](old, raw, x[:, :, -1]))
         prediction = model.latent_out(model.out_norm(x[:, :, :self.n_latents]))
-        return prediction, updated if write_memory else memory
+        loss = value_loss + lse_weight * lse_loss
+        return prediction, updated if write_memory else memory, loss, torch.stack((value_loss, lse_loss))
 
     def forward(self, latents, tau, actions):
         memory, predictions = None, []
@@ -150,11 +166,53 @@ class RecurrentDynamicsModel(nn.Module):
             end = start + self.block_size
             args = (latents[:, start:end], tau[:, start:end], actions[:, start:end], memory, start)
             if self.training and self.recompute:
-                prediction, memory = checkpoint(self.chunk, *args, use_reentrant=False)
+                prediction, memory, _, _ = checkpoint(self.chunk, *args, use_reentrant=False)
             else:
-                prediction, memory = self.chunk(*args)
+                prediction, memory, _, _ = self.chunk(*args)
             predictions.append(prediction)
         return torch.cat(predictions, 1)
+
+    def distill_loss(self, clean, actions, generator=None, *, lse_weight=1.):
+        """Match old-history attention; sum layers and average blocks with memory.
+
+        The frozen backbone supplies one full-sequence teacher pass. Prediction
+        MSEs are diagnostics only; all memory writes remain in the gradient graph.
+        """
+        shape, device = clean.shape[:2], clean.device
+        if not self.block_size < shape[1] <= self.config.max_temporal_length or actions.shape != shape:
+            raise ValueError('Need aligned actions and more than one block within the teacher context')
+        mixture = torch.rand(shape, device=device, generator=generator)
+        middle = torch.randint(1, 127, shape, device=device, generator=generator)
+        tau = torch.where(mixture < .5, 127, torch.where(mixture < .75, 0, middle))
+        noise = torch.randn(clean.shape, device=device, generator=generator)
+        amount = tau.float()[..., None, None] / 127
+        noisy = amount * clean + (1 - amount) * noise
+        with torch.no_grad():
+            teacher, cache = self.backbone(noisy, tau, actions, return_cache=True)
+        memory, predictions, losses, terms, metrics = None, [], [], [], {}
+        for b, start in enumerate(range(0, shape[1], self.block_size)):
+            end = start + self.block_size
+            args = (noisy[:, start:end], tau[:, start:end], actions[:, start:end],
+                    memory, start, True, cache, lse_weight)
+            if self.training and self.recompute:
+                prediction, memory, loss, errors = checkpoint(self.chunk, *args, use_reentrant=False)
+            else:
+                prediction, memory, loss, errors = self.chunk(*args)
+            predictions.append(prediction.detach())
+            if start > 0:
+                losses.append(loss)
+                terms.append(errors.detach())
+                metrics[f'block_{b}_loss'] = loss.detach()
+        loss = torch.stack(losses).mean()
+        value_loss, lse_loss = torch.stack(terms).mean(0)
+        with torch.no_grad():
+            prediction = torch.cat(predictions, 1).float()
+            error = (prediction - clean.float()).square().mean((-1, -2))
+            corrupted = tau < 127
+            metrics.update(distillation_loss=loss.detach(), value_loss=value_loss, lse_loss=lse_loss,
+                teacher_mse=(prediction - teacher.float()).square().mean(),
+                prediction_mse=(error * corrupted).sum() / corrupted.sum().clamp_min(1))
+        return loss, metrics
 
     @torch.no_grad()
     def observe(self, latents, actions, state=None):
@@ -175,7 +233,7 @@ class RecurrentDynamicsModel(nn.Module):
             pending_actions = torch.cat((pending_actions, actions[:, offset:offset + take]), 1)
             offset += take
             if pending.shape[1] == self.block_size:
-                _, memory = self.chunk(pending, torch.full_like(pending_actions, 127), pending_actions, memory, start)
+                _, memory, _, _ = self.chunk(pending, torch.full_like(pending_actions, 127), pending_actions, memory, start)
                 start += self.block_size
                 pending, pending_actions = pending[:, :0], pending_actions[:, :0]
         return RecurrentState(memory, pending, pending_actions, start)
@@ -193,7 +251,7 @@ class RecurrentDynamicsModel(nn.Module):
         schedule = [round(k * 127 / K) for k in range(K + 1)]
         for begin, end in zip(schedule[:-1], schedule[1:]):
             tau[:, -1] = begin
-            prediction, _ = self.chunk(torch.cat((state.latents, z), 1), tau, actions,
+            prediction, _, _, _ = self.chunk(torch.cat((state.latents, z), 1), tau, actions,
                                        state.memory, state.start, write_memory=False)
             z = z + (prediction[:, -1:] - z) * ((end - begin) / (127 - begin))
         return z, self.observe(z, action, state)
